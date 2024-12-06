@@ -1,0 +1,486 @@
+import curses
+import random
+import time
+import logging
+import argparse
+from collections import Counter, deque
+from dataclasses import dataclass
+from typing import List, Optional
+from enum import Enum
+
+# Setup logging with conditional debug mode
+logger = logging.getLogger('slot_machine')
+logger.addHandler(logging.NullHandler())  # Default no logging
+
+def setup_debug_logging():
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler('slot_debug.log')
+    fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    logger.addHandler(fh)
+
+class SpinMode(Enum):
+    SINGLE = "Single Spin"
+    FIVE = "5 Spins"
+    TEN = "10 Spins"
+    AUTO = "Auto Spin"
+
+@dataclass
+class SpinResult:
+    symbols: List[str]
+    payout: int
+    balance: int
+    timestamp: float
+
+SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "💎", "💰", "🎲", "🌟"]
+PAYOUTS = {
+    "🍒": 2, "🍋": 3, "🍊": 4, "🍇": 5,
+    "💎": 10, "💰": 15, "🎲": 20, "🌟": 50
+}
+
+FRAME_WIDTH = 18  # Adjusted width for better spacing
+SYMBOL_SPACING = " "  # Single space between symbols
+SECTION_TITLE_WIDTH = 17  # Width of "=== XXXXX ===" format
+
+class SlotReel:
+    def __init__(self, reel_id):
+        # Debug: Log all symbols before creating reel
+        logger.debug(f"Available symbols: {SYMBOLS}")
+        logger.debug(f"Symbol lengths: {[len(s) for s in SYMBOLS]}")
+        
+        # Verify we have all symbols
+        self.symbols = SYMBOLS.copy()  # Make a copy to preserve original
+        if len(self.symbols) != 8:
+            logger.error(f"Expected 8 symbols, got {len(self.symbols)}")
+            raise ValueError(f"Expected 8 symbols, got {len(self.symbols)}")
+            
+        # Debug: Log symbols before and after shuffle
+        logger.debug(f"Reel {reel_id} before shuffle: {self.symbols}")
+        random.shuffle(self.symbols)
+        logger.debug(f"Reel {reel_id} after shuffle: {self.symbols}")
+        
+        self.position = 0
+        self.length = len(self.symbols)
+        self.reel_id = reel_id
+    
+    def rotate(self):
+        """Rotate the reel by one position"""
+        self.position = (self.position + 1) % self.length
+    
+    def verify_symbols(self):
+        """Verify all symbols are present and valid"""
+        symbol_set = set(self.symbols)
+        expected_set = set(SYMBOLS)
+        if symbol_set != expected_set:
+            logger.error(f"Missing: {expected_set - symbol_set}")
+            logger.error(f"Extra: {symbol_set - expected_set}")
+        return symbol_set == expected_set
+    
+    def get_visible_symbols(self):
+        """Get the three visible symbols (above, current, below)"""
+        symbols = []
+        for offset in range(-1, 2):
+            idx = (self.position + offset) % self.length
+            symbol = self.symbols[idx]
+            # Debug: Check if symbol is valid
+            if not symbol or len(symbol) == 0:
+                logger.error(f"Invalid symbol at position {idx}: '{symbol}'")
+            symbols.append(symbol)
+        return symbols
+
+class SlotMachine:
+    def __init__(self, screen):
+        self.screen = screen
+        self.balance = 1000
+        self.starting_balance = self.balance
+        self.bet = 10
+        
+        # Debug: Log symbols before creating reels
+        logger.debug("Initializing slot machine with symbols:")
+        for i, symbol in enumerate(SYMBOLS):
+            logger.debug(f"Symbol {i}: '{symbol}' (length: {len(symbol)})")
+        
+        self.reels = [SlotReel(i) for i in range(3)]
+        
+        # Verify all reels after creation
+        logger.debug("\nVerifying reels after creation:")
+        for i, reel in enumerate(self.reels):
+            logger.debug(f"Reel {i} symbols: {reel.symbols}")
+            if not reel.verify_symbols():
+                logger.error(f"WARNING: Reel {i} is missing symbols!")
+        
+        self.height, self.width = screen.getmaxyx()
+        self.symbol_counts = Counter()
+        self.spin_history = deque(maxlen=30)
+        self.last_win = None
+        self.show_stats = False
+        self.spin_mode = SpinMode.SINGLE
+        self.spins_remaining = 0
+        self.auto_spinning = False
+        self.biggest_win = None
+        self.session_start = time.time()
+        self.left_margin = None
+    
+    def calculate_margins(self):
+        """Calculate the left margin for aligned text"""
+        center = self.width // 2
+        self.left_margin = center - 9  # Adjusted from -8 to -9 for text alignment
+    
+    def draw_centered(self, y, text, align="center"):
+        """Draw text at the specified y position with proper alignment"""
+        try:
+            text = text.replace("┃", "").strip()
+            if self.left_margin is None:
+                self.calculate_margins()
+                
+            if align == "center":
+                x = max(0, (self.width - len(text)) // 2)
+            else:  # left align with offset from center
+                x = self.left_margin
+                
+            self.screen.addstr(y, x, text)
+        except curses.error:
+            # Silently handle drawing errors
+            pass
+    
+    def spin(self):
+        """Perform the actual spinning animation and return winnings"""
+        # Keep current positions and continue spinning from there
+        for reel_idx in range(3):
+            spins = 20 + (reel_idx * 8)
+            
+            for _ in range(spins):
+                self.reels[reel_idx].rotate()
+                if random.random() < 0.3:
+                    self.reels[reel_idx].rotate()
+                
+                self.draw_machine()
+                self.screen.refresh()
+                time.sleep(0.05)
+            
+            # Gradually slow down
+            for i in range(5):
+                self.reels[reel_idx].rotate()
+                self.draw_machine()
+                self.screen.refresh()
+                time.sleep(0.1 + (i * 0.05))
+        
+        # Record spin result
+        middle_symbols = [reel.get_visible_symbols()[1] for reel in self.reels]
+        winnings = self.check_win(middle_symbols)
+        
+        spin_result = SpinResult(
+            symbols=middle_symbols,
+            payout=winnings,
+            balance=self.balance,
+            timestamp=time.time()
+        )
+        self.spin_history.append(spin_result)
+        
+        if winnings > 0:
+            self.last_win = spin_result
+        
+        return winnings
+    
+    def draw_machine(self):
+        self.screen.clear()
+        
+        try:
+            # Calculate center once
+            center_x = self.width // 2
+            
+            # Title
+            title = "🐕 LEMDOG SLOTS 🎲"
+            title_x = center_x - (len(title) // 2)
+            self.screen.addstr(1, title_x, title)
+            
+            if self.show_stats:
+                self.draw_stats_view(3)
+                return
+            
+            frame_y = 3
+            
+            # Calculate frame position to match title centering
+            frame_width_with_borders = FRAME_WIDTH + 2
+            frame_x = title_x + (len(title) - frame_width_with_borders) // 2
+            
+            # Calculate exact position for right border
+            right_border_x = frame_x + FRAME_WIDTH + 1
+            
+            try:
+                # Draw top border
+                self.screen.addstr(frame_y, frame_x, f"┏{'━' * FRAME_WIDTH}┓")
+                
+                # Draw each row with content
+                for row in range(3):
+                    symbols = [reel.get_visible_symbols()[row] for reel in self.reels]
+                    symbol_display = SYMBOL_SPACING.join(symbols)
+                    
+                    # Calculate centering within frame
+                    content_width = len(symbol_display)
+                    if row == 1:  # Middle row with arrows
+                        content_width += 2  # Add space for arrows
+                    
+                    # Calculate padding with left bias
+                    total_space = FRAME_WIDTH - content_width
+                    left_padding = (total_space // 2) - 1
+                    right_padding = total_space - left_padding
+                    
+                    # Draw left border and content
+                    if row == 1:  # Middle row with arrows
+                        content = f"┃{' ' * left_padding}▶{symbol_display}◀{' ' * right_padding}"
+                    else:
+                        content = f"┃{' ' * left_padding}{symbol_display}{' ' * right_padding}"
+                    
+                    self.screen.addstr(frame_y + row + 1, frame_x, content)
+                    
+                    # Draw right border separately at exact position
+                    self.screen.addstr(frame_y + row + 1, right_border_x, "┃")
+                
+                # Draw bottom border
+                self.screen.addstr(frame_y + 4, frame_x, f"┗{'━' * FRAME_WIDTH}┛")
+            except curses.error:
+                pass
+            
+            # Draw last win
+            if self.last_win:
+                win_symbols = " ".join(self.last_win.symbols)
+                self.draw_centered(frame_y + 5, f"Last Win: {win_symbols} ${self.last_win.payout}")
+            else:
+                self.draw_centered(frame_y + 5, "No wins yet!")
+            
+            # Stats and mode - shifted right
+            self.draw_centered(frame_y + 8, f"Balance: ${self.balance}", "left")
+            self.draw_centered(frame_y + 9, f"Current Bet: ${self.bet}", "left")
+            
+            # Mode display
+            mode_display = f"Mode: {self.spin_mode.value}"
+            if self.auto_spinning:
+                mode_display += " (RUNNING)"
+            elif self.spins_remaining > 0:
+                mode_display += f" ({self.spins_remaining} left)"
+            self.draw_centered(frame_y + 10, mode_display, "left")
+            
+            # Section titles and controls
+            title_x = center_x - (SECTION_TITLE_WIDTH // 2)
+            try:
+                self.screen.addstr(frame_y + 12, title_x, "=== CONTROLS ===")
+                
+                # Controls - shifted right
+                self.draw_centered(frame_y + 13, "SPACE - Spin/Stop Auto", "left")
+                self.draw_centered(frame_y + 14, "↑/↓ - Adjust Bet", "left")
+                self.draw_centered(frame_y + 15, "←/→ - Change Mode", "left")
+                self.draw_centered(frame_y + 16, "TAB - Toggle Stats", "left")
+                self.draw_centered(frame_y + 17, "Q - Quit", "left")
+                
+                # Payouts section
+                self.screen.addstr(frame_y + 19, title_x, "=== PAYOUTS ===")
+                
+                # Payouts
+                payout_str = "  ".join(f"{s}:{PAYOUTS[s]}x" for s in SYMBOLS[:4])
+                self.draw_centered(frame_y + 20, payout_str)
+                payout_str = "  ".join(f"{s}:{PAYOUTS[s]}x" for s in SYMBOLS[4:])
+                self.draw_centered(frame_y + 21, payout_str)
+            except curses.error:
+                # If we can't draw everything, at least show the game
+                pass
+        except curses.error:
+            # Handle terminal too small for even basic display
+            try:
+                self.screen.addstr(0, 0, "Terminal too small!")
+            except curses.error:
+                pass
+    
+    def format_time(self, seconds):
+        minutes = int(seconds // 60)
+        hours = minutes // 60
+        if hours > 0:
+            return f"{hours}h {minutes % 60}m"
+        return f"{minutes}m"
+    
+    def perform_spin(self):
+        """Handle a single spin including bet deduction and win processing"""
+        if self.balance < self.bet:
+            return False
+            
+        self.balance -= self.bet
+        winnings = self.spin()
+        
+        if winnings > 0:
+            if not self.biggest_win or winnings > self.biggest_win.payout:
+                self.biggest_win = self.last_win
+                
+        return True
+    
+    def check_win(self, middle_symbols):
+        """Check if the middle row symbols constitute a win"""
+        if all(symbol == middle_symbols[0] for symbol in middle_symbols):
+            winnings = self.bet * PAYOUTS[middle_symbols[0]]
+            self.balance += winnings
+            return winnings
+        return 0
+    
+    def handle_auto_spin(self):
+        """Handle automatic spinning based on current mode"""
+        if not self.auto_spinning:
+            return
+            
+        if self.spin_mode == SpinMode.AUTO:
+            if self.perform_spin():
+                # Force a redraw after each spin to update the RUNNING indicator
+                self.draw_machine()
+                self.screen.refresh()
+        elif self.spins_remaining > 0:
+            if self.perform_spin():
+                self.spins_remaining -= 1
+                # Force a redraw after each spin to update the RUNNING indicator
+                self.draw_machine()
+                self.screen.refresh()
+            if self.spins_remaining == 0:
+                self.auto_spinning = False
+    
+    def start_auto_spin(self):
+        """Start auto-spinning based on current mode"""
+        if self.balance < self.bet:
+            return
+            
+        self.auto_spinning = True
+        if self.spin_mode == SpinMode.SINGLE:
+            self.perform_spin()
+            self.auto_spinning = False
+        elif self.spin_mode == SpinMode.FIVE:
+            self.spins_remaining = 5
+        elif self.spin_mode == SpinMode.TEN:
+            self.spins_remaining = 10
+    
+    def draw_stats_view(self, frame_y):
+        """Draw the statistics view"""
+        self.draw_centered(frame_y, "=== SPIN HISTORY ===")
+        
+        # Show last 10 spins
+        history = list(self.spin_history)[-10:]
+        if not history:
+            self.draw_centered(frame_y + 2, "No spins yet!")
+            return
+            
+        for i, spin in enumerate(history):
+            symbols_str = " ".join(spin.symbols)
+            result_str = f"Win: ${spin.payout}" if spin.payout > 0 else "No win"
+            self.draw_centered(frame_y + i + 2, f"{symbols_str} - {result_str}")
+        
+        # Session stats
+        session_time = time.time() - self.session_start
+        total_spins = len(self.spin_history)
+        wins = sum(1 for spin in self.spin_history if spin.payout > 0)
+        win_rate = (wins / total_spins * 100) if total_spins > 0 else 0
+        profit = self.balance - self.starting_balance
+        
+        stats_y = frame_y + 13
+        self.draw_centered(stats_y, "=== SESSION STATS ===")
+        self.draw_centered(stats_y + 1, f"Time: {self.format_time(session_time)}")
+        self.draw_centered(stats_y + 2, f"Spins: {total_spins}")
+        self.draw_centered(stats_y + 3, f"Win Rate: {win_rate:.1f}%")
+        self.draw_centered(stats_y + 4, f"Profit: ${profit}")
+        if self.biggest_win:
+            big_win = " ".join(self.biggest_win.symbols)
+            self.draw_centered(stats_y + 5, f"Biggest Win: {big_win} ${self.biggest_win.payout}")
+        
+        # Balance graph
+        if len(history) > 1:
+            self.draw_centered(stats_y + 7, "=== BALANCE HISTORY ===")
+            
+            # Use starting balance and all spin results
+            points = [(0, self.starting_balance)]
+            points.extend((i + 1, spin.balance) for i, spin in enumerate(history))
+            
+            graph_width = 30
+            graph_height = 8
+            
+            # Calculate range with padding
+            max_bal = max(p[1] for p in points)
+            min_bal = min(p[1] for p in points)
+            padding = (max_bal - min_bal) * 0.1
+            max_bal += padding
+            min_bal -= padding
+            
+            # Draw y-axis labels
+            self.draw_centered(stats_y + 8, f"${max_bal:.0f}")
+            self.draw_centered(stats_y + 8 + graph_height - 1, f"${min_bal:.0f}")
+            
+            # Draw graph
+            for y in range(graph_height):
+                line = ["│" if x == 0 else " " for x in range(graph_width + 1)]
+                
+                # Draw connecting lines between points
+                for i in range(len(points) - 1):
+                    x1 = int(points[i][0] * graph_width / (len(points) - 1))
+                    x2 = int(points[i + 1][0] * graph_width / (len(points) - 1))
+                    y1 = int((max_bal - points[i][1]) * (graph_height - 1) / (max_bal - min_bal))
+                    y2 = int((max_bal - points[i + 1][1]) * (graph_height - 1) / (max_bal - min_bal))
+                    
+                    if y1 == y2 == y:
+                        for x in range(x1, x2 + 1):
+                            line[x] = "─"
+                    elif min(y1, y2) <= y <= max(y1, y2):
+                        if x1 < len(line):
+                            line[x1] = "●"
+                        if x2 < len(line):
+                            line[x2] = "●"
+                
+                self.draw_centered(stats_y + 8 + y, "".join(line))
+            
+            # Draw x-axis
+            self.draw_centered(stats_y + 8 + graph_height, "└" + "─" * graph_width)
+
+def main(stdscr):
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug logging')
+    args = parser.parse_args()
+    
+    if args.debug:
+        setup_debug_logging()
+    
+    curses.start_color()
+    curses.use_default_colors()
+    curses.curs_set(0)
+    stdscr.timeout(100)
+    
+    slot_machine = SlotMachine(stdscr)
+    
+    while True:
+        slot_machine.draw_machine()
+        slot_machine.handle_auto_spin()
+        
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            continue
+            
+        if key == ord('q'):
+            break
+        elif key == ord(' '):
+            if slot_machine.auto_spinning:
+                slot_machine.auto_spinning = False
+                slot_machine.spins_remaining = 0
+                # Force immediate redraw when stopping auto-spin
+                slot_machine.draw_machine()
+                stdscr.refresh()
+            else:
+                slot_machine.start_auto_spin()
+        elif key == ord('\t'):
+            slot_machine.show_stats = not slot_machine.show_stats
+        elif key == curses.KEY_UP:
+            slot_machine.bet = min(100, slot_machine.bet + 5)
+        elif key == curses.KEY_DOWN:
+            slot_machine.bet = max(5, slot_machine.bet - 5)
+        elif key == curses.KEY_RIGHT:
+            modes = list(SpinMode)
+            current_idx = modes.index(slot_machine.spin_mode)
+            slot_machine.spin_mode = modes[(current_idx + 1) % len(modes)]
+        elif key == curses.KEY_LEFT:
+            modes = list(SpinMode)
+            current_idx = modes.index(slot_machine.spin_mode)
+            slot_machine.spin_mode = modes[(current_idx - 1) % len(modes)]
+
+if __name__ == "__main__":
+    curses.wrapper(main) 
