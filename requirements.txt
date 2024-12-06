@@ -1,0 +1,12 @@
+# Core dependencies
+simpleaudio>=1.0.4  # For sound effects
+windows-curses>=2.3.1; platform_system == "Windows"  # Curses support for Windows
+typing-extensions>=4.7.1  # For enhanced type hints
+
+# Development dependencies
+black>=23.9.1  # Code formatting
+mypy>=1.5.1  # Static type checking
+pylint>=2.17.5  # Code linting
+
+# Note: On macOS, you might need to install portaudio first:
+# brew install portaudio
